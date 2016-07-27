@@ -1,0 +1,59 @@
+--- a/drivers/net/wireless/ath/ath.h
++++ b/drivers/net/wireless/ath/ath.h
+@@ -23,6 +23,16 @@
+ #include <linux/spinlock.h>
+ #include <net/mac80211.h>
+ 
++/* RegMon */
++#if defined (CPTCFG_ATH5K_DEBUG) || defined (CPTCFG_ATH9K_DEBUGFS)
++#include <linux/timer.h>
++#include <linux/hrtimer.h>
++/* maximum number of 32-bit registers RegMon monitors */
++#define MAX_REG_COUNT 12
++/* maximum size RegMon ringbufer in number of rows */
++#define REG_LOG_ROWS 30000
++#endif /* RegMon */
++
+ /*
+  * The key cache is used for h/w cipher state and also for
+  * tracking station state such as the current tx antenna.
+@@ -144,6 +154,15 @@ struct ath_ps_ops {
+ 	void (*restore)(struct ath_common *common);
+ };
+ 
++
++#if defined (CPTCFG_ATH5K_DEBUG) || defined (CPTCFG_ATH9K_DEBUGFS)
++/* RegMon hrtimer */
++struct hrtimer_mod {
++	struct hrtimer timer;	/* the hrtime */
++	ktime_t interval;	/* interval to use in hrtimer_forward */
++};
++#endif
++
+ struct ath_common {
+ 	void *ah;
+ 	void *priv;
+@@ -163,6 +182,23 @@ struct ath_common {
+ 
+ 	u32 rx_bufsize;
+ 
++#if defined (CPTCFG_ATH5K_DEBUG) || defined (CPTCFG_ATH9K_DEBUGFS)
++	/* RegMon */
++	s64 *reg_hosttime;
++	u32 reg_interval;
++	u32 reg_hz;
++	u32 reg[MAX_REG_COUNT];
++	u32 *reg_log[MAX_REG_COUNT];
++	int reg_last;
++	int reg_current;
++	int reg_count;
++	int shutdown;
++	spinlock_t reg_lock;
++	struct dentry *debugfs_dir;
++	struct timer_list reg_timer;
++	struct hrtimer_mod hrtm;
++#endif
++
+ 	u32 keymax;
+ 	DECLARE_BITMAP(keymap, ATH_KEYMAX);
+ 	DECLARE_BITMAP(tkip_keymap, ATH_KEYMAX);
