@@ -59,9 +59,13 @@
  	DECLARE_BITMAP(tkip_keymap, ATH_KEYMAX);
 --- /dev/null
 +++ b/drivers/net/wireless/ath/regmon.h
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,13 @@
 +#ifndef _REGMON_H_
 +#define _REGMON_H_
++
++#include <linux/types.h>
++#include <linux/timer.h>
++#include <linux/hrtimer.h>
 +
 +static ssize_t reg_log_read_regmon(struct file *file, char __user *userbuf,
 +				   size_t count, loff_t *ppos, bool ath9k);
@@ -71,10 +75,11 @@
 +
 --- /dev/null
 +++ b/drivers/net/wireless/ath/regmon.c
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,193 @@
++#include "regmon.h"
 +#include "ath.h"
-+#include "ath5k/ath5k.h"
 +#include "ath9k/ath9k.h"
++#include "ath5k/ath5k.h"
 +
 +#define REGMON_REG_READ(_ah, _reg, _9k) \
 +	do { \
@@ -82,7 +87,7 @@
 +			REG_READ(_ah, _reg); \
 +		else \
 +			ath5k_hw_reg_read(_ah, _reg); \
-+	} while (0)
++	} while (0);
 +
 +#define REGMON_REG_WRITE(_ah, _val, _reg) \
 +	do { \
@@ -90,12 +95,12 @@
 +			REG_WRITE(_ah, _reg, _val); \
 +		else \
 +			ath5k_hw_reg_write(_ah, _val, _rg); \
-+	} while (0)
++	} while (0);
 +
 +/* RegMon reads from userspace */
 +static ssize_t
 +reg_log_read_regmon(struct file *file,
-+		    char user *userbuf, size_t count,
++		    char __user *userbuf, size_t count,
 +		    loff_t *ppos, bool ath9k)
 +{
 +	struct ath_common *common;
@@ -264,3 +269,40 @@
 +	return HRTIMER_RESTART;
 +}
 +
+--- a/drivers/net/wireless/ath/Makefile
++++ b/drivers/net/wireless/ath/Makefile
+@@ -15,7 +15,8 @@ ath-objs :=	main.o \
+ 		key.o \
+ 		debug.o \
+ 		dfs_pattern_detector.o \
+-		dfs_pri_detector.o
++		dfs_pri_detector.o \
++		regmon.o
+ 
+ ath-$(CPTCFG_ATH_TRACEPOINTS) += trace.o
+ 
+--- a/drivers/net/wireless/ath/ath9k/main.c
++++ b/drivers/net/wireless/ath/ath9k/main.c
+@@ -19,6 +19,22 @@
+ #include "ath9k.h"
+ #include "btcoex.h"
+ 
++static ssize_t reg_log_read(struct file *file, char __user *userbuf,
++			    size_t count, loff_t *ppos)
++{
++	bool ath9k = true;
++
++	return reg_log_read_regmon(file, userbuf, count, ppos);
++}
++
++/* RegMon file handles */
++static const struct file_operations reg_log_ops = {
++	.read = reg_log_read,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
+ u8 ath9k_parse_mpdudensity(u8 mpdudensity)
+ {
+ 	/*
