@@ -1,0 +1,231 @@
+--- a/drivers/net/wireless/ath/ath.h
++++ b/drivers/net/wireless/ath/ath.h
+@@ -23,6 +23,16 @@
+ #include <linux/spinlock.h>
+ #include <net/mac80211.h>
+ 
++/* RegMon */
++#if defined (CPTCFG_ATH5K_DEBUG) || defined (CPTCFG_ATH9K_DEBUGFS)
++#include <linux/timer.h>
++#include <linux/hrtimer.h>
++/* maximum number of 32-bit registers RegMon monitors */
++#define MAX_REG_COUNT 12
++/* maximum size RegMon ringbufer in number of rows */
++#define REG_LOG_ROWS 30000
++#endif /* RegMon */
++
+ /*
+  * The key cache is used for h/w cipher state and also for
+  * tracking station state such as the current tx antenna.
+@@ -144,6 +154,14 @@ struct ath_ps_ops {
+ 	void (*restore)(struct ath_common *common);
+ };
+ 
++#if defined (CPTCFG_ATH5K_DEBUG) || defined (CPTCFG_ATH9K_DEBUGFS)
++/* RegMon hrtimer */
++struct hrtimer_mod {
++	struct hrtimer timer;	/* the hrtime */
++	ktime_t interval;	/* interval to use in hrtimer_forward */
++};
++#endif
++
+ struct ath_common {
+ 	void *ah;
+ 	void *priv;
+@@ -163,6 +181,23 @@ struct ath_common {
+ 
+ 	u32 rx_bufsize;
+ 
++#if defined (CPTCFG_ATH5K_DEBUG) || defined (CPTCFG_ATH9K_DEBUGFS)
++	/* RegMon */
++	s64 *reg_hosttime;
++	u32 reg_interval;
++	u32 reg_hz;
++	u32 reg[MAX_REG_COUNT];
++	u32 *reg_log[MAX_REG_COUNT];
++	int reg_last;
++	int reg_current;
++	int reg_count;
++	int shutdown;
++	spinlock_t reg_lock;
++	struct dentry *debugfs_dir;
++	struct timer_list reg_timer;
++	struct hrtimer_mod hrtm;
++#endif
++
+ 	u32 keymax;
+ 	DECLARE_BITMAP(keymap, ATH_KEYMAX);
+ 	DECLARE_BITMAP(tkip_keymap, ATH_KEYMAX);
+--- a/drivers/net/wireless/ath/ath9k/Makefile
++++ b/drivers/net/wireless/ath/ath9k/Makefile
+@@ -6,7 +6,8 @@ ath9k-y +=	beacon.o \
+ 		xmit.o \
+ 		link.o \
+ 		antenna.o \
+-		channel.o
++		channel.o \
++		ath9k_regmon.o
+ 
+ ath9k-$(CPTCFG_ATH9K_BTCOEX_SUPPORT) += mci.o
+ ath9k-$(CPTCFG_ATH9K_PCI) += pci.o
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath9k/ath9k_regmon.c
+@@ -0,0 +1,158 @@
++#include "../ath.h"
++#include "ath9k.h"
++
++/* RegMon reads from userspace */
++static ssize_t
++reg_log_read_regmon(struct file *file,
++		    char __user *userbuf, size_t count,
++		    loff_t *ppos, bool ath9k)
++{
++	struct ath_softc *sc = file->private_data;
++	struct ath_common *common = &sc->sc_ah->common;
++	char buf[256];
++	size_t len, n, ret;
++	size_t sum = 0;
++	loff_t pos;
++	u8 i;
++
++	spin_lock_bh(&common->reg_lock);
++
++	while (common->reg_last != common->reg_current && count > 0) {
++		spin_unlock_bh(&common->reg_lock);
++
++		/* first entry host time, second wifi cards mac time */
++		len = scnprintf(buf, sizeof(buf), "%.19lld %.8x%.8x",
++				common->reg_hosttime[common->reg_last],
++				(unsigned int) common->reg_log[0][common->reg_last],
++				(unsigned int) common->reg_log[1][common->reg_last]);
++
++		/* print register values */
++		for (i = 2; i < MAX_REG_COUNT; i++) {
++			len += scnprintf(buf + len, sizeof(buf) - len,
++					 " %.8x", (unsigned int)
++					 common->reg_log[i][common->reg_last]);
++		}
++
++		/* add line wrap */
++		len += scnprintf(buf + len, sizeof(buf) - len, "\n");
++
++		n = 0;
++		if (*ppos < len && count > 0) {
++			n = count;
++			pos = *ppos;
++
++			if (pos < 0)
++				return -EINVAL;
++
++			if (n > len - pos)
++				n = len - pos;
++
++			ret = copy_to_user(userbuf, buf + pos, n);
++			if (ret == n)
++				return -EFAULT;
++
++			n -= ret;
++			*ppos = pos + n;
++		}
++
++		spin_lock_bh(&common->reg_lock);
++
++		sum += n;
++		count -= n;
++		if (count <= 0)
++			break;
++
++		userbuf += n;
++		*ppos = 0;
++
++		if (++common->reg_last >= REG_LOG_ROWS - 1)
++			common->reg_last = 0;
++	}
++
++	spin_unlock_bh(&common->reg_lock);
++
++	return sum;
++}
++
++/* Register RegMons periodic readings via htimer */
++static enum hrtimer_restart
++read_registers(struct hrtimer *hrtimer, bool ath9k)
++{
++	struct hrtimer_mod  *hrtm = container_of(hrtimer_mod,
++						 struct hrtimer, hrtimer_mod);
++	struct ath_softc *sc = container_of(hrtm, struct ath_common, hrtm);
++	struct ath_hw ah = sc->sc_ah;
++	struct ath_common *common = ah->common;
++	static struct timespec ts;
++
++	int i;
++
++	if (common->shutdown)
++		return HRTIMER_NORESTART;
++
++	/* get current kernel time per row */
++	getnstimeofday(&ts);
++	common->reg_hosttime[common->reg_current] = timespec_to_ns(&ts);
++
++	/* get upper 32-bit tsf timestamp from card */
++	common->reg_log[0][common->reg_current] =
++					REG_READ(ah, 0x8050);
++	/* get lower 32-bit tsf timestamp from card */
++	common->reg_log[1][common->reg_current] =
++					REG_READ(ah, 0x804c);
++
++	/* freeze all MIB registers */
++	REG_WRITE(ah, AR_MIBC, AR_MIBC_FMC);
++
++	/* read current MAC states from hardware registers
++	 * 0x80f8 -> MAC cycles (number of clock cycles at a given clock speed)
++	 *                      5GHz @20MHz -> tick freq. = 40MHz
++	 *                      5GHz @40MHz -> tick freq. = 80MHz
++	 *                      2.4GHz @20MHz -> tick freq. = 44MHz
++	 *                      2.4GHz @40MHz -> tick freq. = 88MHz
++	 * 0x80ec -> TX busy(number of cycles the transmitter unit is active)
++	 * 0x80f0 -> RX busy(number of cycles the receiver unit is active)
++	 * 0x80f4 -> MAC busy(sum of TX, RX and energy detection busy cycles) */
++	common->reg_log[2][common->reg_current] =
++			REG_READ(ah, 0x80f8); //MAC counter
++	common->reg_log[3][common->reg_current] =
++			REG_READ(ah, 0x80ec); //TX busy
++	common->reg_log[4][common->reg_current] =
++			REG_READ(ah, 0x80f0); //RX busy
++	common->reg_log[5][common->reg_current] =
++			REG_READ(ah, 0x80f4); //ED busy
++
++	/* un-freeze MIB registers */
++	REG_WRITE(ah, AR_MIBC, 0);
++
++	/* read lower 32-bit tsf again to calc duration of MAC state readings */
++	common->reg_log[6][common->reg_current] =
++					REG_READ(ah, 0x804c);
++
++	/* if set, than read additional register values [7...MAX_REG_COUNT] */
++	for (i = 7; i < MAX_REG_COUNT; i++) {
++		if (common->reg[7] != 0)
++			common->reg_log[i][common->reg_current] =
++				REG_READ(ah, common->reg[i]);
++		else
++			common->reg_log[i][common->reg_current] = 0;
++	}
++
++	/* handle ring buffer writings */
++	spin_lock(&common->reg_lock);
++	if (++common->reg_current > REG_LOG_ROWS - 1)
++		common->reg_current = 0;
++	if ((common->reg_last == common->reg_current) &&
++	    (++common->reg_last > REG_LOG_ROWS - 1))
++		common->reg_last = 0;
++	spin_unlock(&common->reg_lock);
++
++	/* set sampling interval if changed */
++	if (common->reg_interval > 0)
++		hrtimer_forward(hrtimer, ktime_get(), ns_to_ktime(common->reg_interval));
++	else
++		hrtimer_forward(hrtimer, ktime_get(), ns_to_ktime(10000000));
++
++	return HRTIMER_RESTART;
++}
++
