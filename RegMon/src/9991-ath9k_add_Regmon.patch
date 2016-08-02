@@ -69,7 +69,7 @@
  		link.o \
  		antenna.o \
 -		channel.o
-+		channel.o 
++		channel.o
  
  ath9k-$(CPTCFG_ATH9K_BTCOEX_SUPPORT) += mci.o
  ath9k-$(CPTCFG_ATH9K_PCI) += pci.o
