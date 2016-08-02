@@ -58,27 +58,30 @@
  	DECLARE_BITMAP(tkip_keymap, ATH_KEYMAX);
 --- a/drivers/net/wireless/ath/ath9k/Makefile
 +++ b/drivers/net/wireless/ath/ath9k/Makefile
-@@ -6,7 +6,8 @@ ath9k-y +=	beacon.o \
+@@ -1,12 +1,13 @@
+ ath9k-y +=	beacon.o \
+ 		gpio.o \
++		ath9k_regmon.o \
+ 		init.o \
+ 		main.o \
+ 		recv.o \
  		xmit.o \
  		link.o \
  		antenna.o \
 -		channel.o
-+		channel.o \
-+		ath9k_regmon.o
++		channel.o 
  
  ath9k-$(CPTCFG_ATH9K_BTCOEX_SUPPORT) += mci.o
  ath9k-$(CPTCFG_ATH9K_PCI) += pci.o
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath9k/ath9k_regmon.c
-@@ -0,0 +1,158 @@
-+#include "../ath.h"
-+#include "ath9k.h"
+@@ -0,0 +1,155 @@
++#include "ath9k_regmon.h"
 +
 +/* RegMon reads from userspace */
-+static ssize_t
-+reg_log_read_regmon(struct file *file,
-+		    char __user *userbuf, size_t count,
-+		    loff_t *ppos, bool ath9k)
++ssize_t
++reg_log_read_regmon(struct file *file, char __user *userbuf, size_t count,
++		    loff_t *ppos)
 +{
 +	struct ath_softc *sc = file->private_data;
 +	struct ath_common *common = &sc->sc_ah->common;
@@ -148,14 +151,13 @@
 +}
 +
 +/* Register RegMons periodic readings via htimer */
-+static enum hrtimer_restart
-+read_registers(struct hrtimer *hrtimer, bool ath9k)
++enum hrtimer_restart
++read_registers_regmon(struct hrtimer *hrtimer)
 +{
-+	struct hrtimer_mod  *hrtm = container_of(hrtimer_mod,
-+						 struct hrtimer, hrtimer_mod);
-+	struct ath_softc *sc = container_of(hrtm, struct ath_common, hrtm);
-+	struct ath_hw ah = sc->sc_ah;
-+	struct ath_common *common = ah->common;
++	struct hrtimer_mod  *hrtm = container_of(hrtimer,
++						 struct hrtimer_mod, timer);
++	struct ath_common *common = container_of(hrtm, struct ath_common, hrtm);
++	struct ath_hw *ah = container_of(common, struct ath_hw, common);
 +	static struct timespec ts;
 +
 +	int i;
@@ -229,3 +231,160 @@
 +	return HRTIMER_RESTART;
 +}
 +
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath9k/ath9k_regmon.h
+@@ -0,0 +1,9 @@
++#include "../ath.h"
++#include "ath9k.h"
++#include "hw.h"
++
++
++ssize_t reg_log_read_regmon(struct file *file, char __user *userbuf,
++				   size_t count, loff_t *ppos);
++enum hrtimer_restart read_registers_regmon(struct hrtimer *hrtimer);
++
+--- a/drivers/net/wireless/ath/ath9k/init.c
++++ b/drivers/net/wireless/ath/ath9k/init.c
+@@ -23,7 +23,7 @@
+ #include <linux/relay.h>
+ #include <net/ieee80211_radiotap.h>
+ 
+-#include "ath9k.h"
++#include "ath9k_regmon.h"
+ 
+ struct ath9k_eeprom_ctx {
+ 	struct completion complete;
+@@ -916,6 +916,14 @@ static void ath_get_initial_entropy(stru
+ 	add_device_randomness(buf, sizeof(buf));
+ }
+ 
++/* RegMon file handles */
++ static const struct file_operations reg_log_ops = {
++	.read = reg_log_read_regmon,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++}
++;
+ int ath9k_init_device(u16 devid, struct ath_softc *sc,
+ 		    const struct ath_bus_ops *bus_ops)
+ {
+@@ -924,6 +932,12 @@ int ath9k_init_device(u16 devid, struct
+ 	struct ath_hw *ah;
+ 	int error = 0;
+ 	struct ath_regulatory *reg;
++#ifdef CPTCFG_ATH9K_DEBUGFS
++	/* RegMon varaibles */
++	int i;
++	char *name;
++	char text[32];
++#endif
+ 
+ 	/* Bring up device */
+ 	error = ath9k_init_softc(devid, sc, bus_ops);
+@@ -974,6 +988,45 @@ int ath9k_init_device(u16 devid, struct
+ 		goto unregister;
+ 	}
+ 
++#ifdef CPTCFG_ATH9K_DEBUGFS
++	/* RegMon debugfs entries */
++	common->reg_hosttime = kmalloc(REG_LOG_ROWS * sizeof(s64), GFP_KERNEL);
++
++	for (i = 0; i < MAX_REG_COUNT; i++)
++		common->reg_log[i] = kmalloc(REG_LOG_ROWS * sizeof(u32), GFP_KERNEL);
++
++	common->reg_lock = __SPIN_LOCK_UNLOCKED(regmon);
++	common->reg_hz = HZ;
++
++	common->debugfs_dir = debugfs_create_dir("regmon", sc->hw->wiphy->debugfsdir);
++	if (common->debugfs_dir) {
++		debugfs_create_u32("sampling_interval", S_IWUSR | S_IRUSR,
++				   common->debugfs_dir, &common->reg_interval);
++		debugfs_create_u32("kernel_hz", S_IRUSR, common->debugfs_dir,
++				   &common->reg_hz);
++		debugfs_create_file("register_log", S_IRUSR, common->debugfs_dir,
++				    sc, &reg_log_ops);
++
++		/* debugfs hocks to specify register adresses from user space */
++		for (i = 7; i < MAX_REG_COUNT; i++) {
++			sprintf(text, "register_%d", i);
++			name = text;
++			debugfs_create_x32(name, S_IWUSR | S_IRUSR,
++					   common->debugfs_dir, &common->reg[i]);
++		}
++		printk(KERN_ERR "ath9k debug: RegMon debugsfs created.\n");
++
++		/* init hrtimers with default interval of 10.000.000 nsec */
++		common->reg_interval = 10000000;
++		hrtimer_init(&common->hrtm.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++		common->hrtm.timer.function = read_registers_regmon;
++		printk(KERN_ERR "ath9k debug: RegMon hrtimer initialized.\n");
++	} else {
++		printk(KERN_ERR "ath9k debug: Unable to create RegMons debugfs files\n");
++		goto unregister;
++	}
++#endif
++
+ 	/* Handle world regulatory */
+ 	if (!ath_is_world_regd(reg)) {
+ 		error = regulatory_hint(hw->wiphy, reg->alpha2);
+--- a/drivers/net/wireless/ath/ath9k/main.c
++++ b/drivers/net/wireless/ath/ath9k/main.c
+@@ -16,7 +16,7 @@
+ 
+ #include <linux/nl80211.h>
+ #include <linux/delay.h>
+-#include "ath9k.h"
++#include "ath9k_regmon.h"
+ #include "btcoex.h"
+ 
+ u8 ath9k_parse_mpdudensity(u8 mpdudensity)
+@@ -145,6 +145,9 @@ void ath9k_ps_restore(struct ath_softc *
+ 	struct ath_common *common = ath9k_hw_common(sc->sc_ah);
+ 	enum ath9k_power_mode mode;
+ 	unsigned long flags;
++#ifdef CPTCFG_ATH9K_DEBUGFS
++	int res, i;
++#endif
+ 
+ 	spin_lock_irqsave(&sc->sc_pm_lock, flags);
+ 	if (--sc->ps_usecount != 0)
+@@ -169,6 +172,21 @@ void ath9k_ps_restore(struct ath_softc *
+ 	}
+ 
+ 	spin_lock(&common->cc_lock);
++#ifdef CPTCFG_ATH9K_DEBUGFS
++	/* RegMon de-init */
++	common->shutdown = 1;
++	res = hrtimer_cancel(&common->hrtm.timer);
++	printk(KERN_ERR "ath9k debug: regmon stopped hrtimer\n");
++
++	debugfs_remove_recursive(common->debugfs_dir);
++
++	kfree(common->reg_hosttime);
++
++	for (i = 0; i < MAX_REG_COUNT; i++) {
++		kfree(common->reg_log[i]);
++	}
++#endif
++
+ 	ath_hw_cycle_counters_update(common);
+ 	spin_unlock(&common->cc_lock);
+ 
+@@ -274,6 +292,16 @@ static bool ath_complete_reset(struct at
+ 	ieee80211_wake_queues(sc->hw);
+ 	ath9k_p2p_ps_timer(sc);
+ 
++#ifdef CPTCFG_ATH9K_DEBUGFS
++	/* RegMon start hrtimer based register readings */
++	/* a certain delay seems to be needed for proper start */
++	usleep_range(10000000,20000000);
++	hrtimer_start(&common->hrtm.timer,
++		      ktime_set(0, common->reg_interval),
++		      HRTIMER_MODE_REL);
++	printk(KERN_ERR "ath9k debug: RegMon hrtimer started successfuly.\n");
++#endif
++
+ 	return true;
+ }
+ 
