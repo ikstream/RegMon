@@ -58,21 +58,13 @@
  	DECLARE_BITMAP(tkip_keymap, ATH_KEYMAX);
 --- a/drivers/net/wireless/ath/ath9k/Makefile
 +++ b/drivers/net/wireless/ath/ath9k/Makefile
-@@ -1,12 +1,13 @@
+@@ -1,5 +1,6 @@
  ath9k-y +=	beacon.o \
  		gpio.o \
 +		ath9k_regmon.o \
  		init.o \
  		main.o \
  		recv.o \
- 		xmit.o \
- 		link.o \
- 		antenna.o \
--		channel.o
-+		channel.o
- 
- ath9k-$(CPTCFG_ATH9K_BTCOEX_SUPPORT) += mci.o
- ath9k-$(CPTCFG_ATH9K_PCI) += pci.o
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath9k/ath9k_regmon.c
 @@ -0,0 +1,153 @@
@@ -343,7 +335,26 @@
  #include "btcoex.h"
  
  u8 ath9k_parse_mpdudensity(u8 mpdudensity)
-@@ -145,6 +146,9 @@ void ath9k_ps_restore(struct ath_softc *
+@@ -98,9 +99,18 @@ void ath_ps_full_sleep(unsigned long dat
+ 	struct ath_softc *sc = (struct ath_softc *) data;
+ 	struct ath_common *common = ath9k_hw_common(sc->sc_ah);
+ 	bool reset;
++#ifdef CPTCFG_ATH9K_DEBUGFS
++	int res;
++#endif
+ 
+ 	spin_lock(&common->cc_lock);
+ 	ath_hw_cycle_counters_update(common);
++#ifdef CPTCFG_ATH9K_DEBUGFS
++	/* RegMon cancel in case of full sleep */
++	common->shutdown = 1;
++	res = hrtimer_try_to_cancel(&common->hrtm.timer);
++	printk(KERN_ERR "ath9k debug: regmon canceled hrtimer in ath_ps_full_sleep \n");
++#endif
+ 	spin_unlock(&common->cc_lock);
+ 
+ 	ath9k_hw_setrxabort(sc->sc_ah, 1);
+@@ -145,6 +155,9 @@ void ath9k_ps_restore(struct ath_softc *
  	struct ath_common *common = ath9k_hw_common(sc->sc_ah);
  	enum ath9k_power_mode mode;
  	unsigned long flags;
@@ -353,7 +364,7 @@
  
  	spin_lock_irqsave(&sc->sc_pm_lock, flags);
  	if (--sc->ps_usecount != 0)
-@@ -169,6 +173,21 @@ void ath9k_ps_restore(struct ath_softc *
+@@ -169,6 +182,21 @@ void ath9k_ps_restore(struct ath_softc *
  	}
  
  	spin_lock(&common->cc_lock);
@@ -375,7 +386,7 @@
  	ath_hw_cycle_counters_update(common);
  	spin_unlock(&common->cc_lock);
  
-@@ -274,6 +293,16 @@ static bool ath_complete_reset(struct at
+@@ -274,6 +302,16 @@ static bool ath_complete_reset(struct at
  	ieee80211_wake_queues(sc->hw);
  	ath9k_p2p_ps_timer(sc);
  
