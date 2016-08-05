@@ -67,7 +67,7 @@
  		recv.o \
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath9k/ath9k_regmon.c
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,156 @@
 +#include "ath9k_regmon.h"
 +
 +/* RegMon reads from userspace */
@@ -86,17 +86,20 @@
 +	while (common->reg_last != common->reg_current && count > 0) {
 +		spin_unlock_bh(&common->reg_lock);
 +
-+		/* first entry host time, second wifi cards mac time */
-+		len = scnprintf(buf, sizeof(buf), "%.19lld %.8x%.8x",
++		/* 1st host time, 2nd delta hosttime, 3dr TSF, 4th delts TSF */
++		len = scnprintf(buf, sizeof(buf), "%.19lld %.8lld %.8x%.8x %.8d",
 +				common->reg_hosttime[common->reg_last],
++				common->reg_hosttime[common->reg_last] - common->reg_hosttime[common->reg_last - 1],
 +				(unsigned int) common->reg_log[0][common->reg_last],
-+				(unsigned int) common->reg_log[1][common->reg_last]);
++				(unsigned int) common->reg_log[1][common->reg_last],
++				(unsigned int) common->reg_log[1][common->reg_last] -
++				 (unsigned int) common->reg_log[1][common->reg_last - 1]);
 +
 +		/* print register values */
 +		for (i = 2; i < MAX_REG_COUNT; i++) {
 +			len += scnprintf(buf + len, sizeof(buf) - len,
-+					 " %.8x", (unsigned int)
-+					 common->reg_log[i][common->reg_last]);
++					 " %.8d", (unsigned int)
++					 common->reg_log[i][common->reg_last] - common->reg_log[i][common->reg_last - 1]);
 +		}
 +
 +		/* add line wrap */
